@@ -1,0 +1,138 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Plex → Stremio Addon Setup</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#101014;color:#f2f2f2;margin:0;padding:32px}main{max-width:900px;margin:auto}.card{background:#191923;border:1px solid #2a2a36;border-radius:16px;padding:24px;margin:16px 0}input,button,select{font:inherit;border-radius:10px;border:1px solid #333;padding:12px;width:100%;box-sizing:border-box}input,select{background:#0d0d12;color:#fff;margin:8px 0 16px}button{background:#7b5cff;color:white;border:0;cursor:pointer;font-weight:700;margin-top:6px}.secondary{background:#303040}.library{display:flex;gap:10px;align-items:center;margin:8px 0}.library input{width:auto;margin:0}code{background:#0d0d12;padding:8px;border-radius:8px;display:block;overflow:auto;white-space:pre-wrap}.muted{color:#aaa}.ok{color:#7cff9b}.err{color:#ff8a8a}.warn{color:#ffd27c}.small{font-size:13px}.server{border:1px solid #2a2a36;border-radius:12px;padding:12px;margin:10px 0;background:#111118}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:700px){.row{grid-template-columns:1fr}body{padding:18px}}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Plex → Stremio Addon Setup V4</h1>
+  <p class="muted">Login with Plex, auto-match Flimra/Stremio IDs, pick an owned/shared server, choose libraries, then generate your private Stremio manifest URL.</p>
+
+  <div class="card">
+    <h2>1. Login with Plex</h2>
+    <p class="small muted">This uses Plex PIN login. You never type your Plex password into this addon.</p>
+    <label>Addon name</label><input id="addonName" value="My Plex in Stremio" />
+    <button onclick="startPlexLogin()">Login with Plex</button>
+    <p id="loginStatus" class="muted"></p>
+    <code id="loginCode" style="display:none"></code>
+    <button id="discoverBtn" style="display:none" onclick="discoverPlex()">Discover Servers</button>
+  </div>
+
+  <div class="card" id="serversCard" style="display:none">
+    <h2>2. Pick your Plex server</h2>
+    <p id="discoverStatus" class="muted"></p>
+    <div id="servers"></div>
+  </div>
+
+  <div class="card" id="libsCard" style="display:none">
+    <h2>3. Select libraries</h2>
+    <div id="chosenServer" class="muted"></div>
+    <div id="libs"></div>
+    <button onclick="createConfig()">Generate Manifest URL</button>
+  </div>
+
+  <div class="card" id="result" style="display:none">
+    <h2 class="ok">4. Done</h2>
+    <p>Paste this into Stremio Addons → Add by URL:</p><code id="manifest"></code>
+    <p>Or try this Stremio install link:</p><code id="stremio"></code>
+  </div>
+
+  <div class="card">
+    <h2>Manual fallback</h2>
+    <p class="small muted">Only use this if Plex login/discovery cannot find your server.</p>
+    <label>Plex server URL</label><input id="plexUrl" placeholder="https://server.plex.direct:32400 or remote URL" />
+    <label>Server access token</label><input id="plexToken" placeholder="X-Plex-Token" type="password" />
+    <button class="secondary" onclick="testPlex()">Test Manual URL & Load Libraries</button>
+    <p id="status" class="muted"></p>
+  </div>
+</main>
+<script>
+let libraries=[];
+let activePlexUrl='';
+let activePlexToken='';
+let accountToken='';
+let pinId=null;
+let pollTimer=null;
+
+function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+function setLibraries(serverLabel, url, token, libs){
+  activePlexUrl=url; activePlexToken=token; libraries=libs || [];
+  chosenServer.textContent=`Using: ${serverLabel} — ${url}`;
+  libs.innerHTML=libraries.map(l=>`<label class="library"><input type="checkbox" value="${l.key}" checked> ${l.title} (${l.type})</label>`).join('');
+  libsCard.style.display='block';
+  result.style.display='none';
+  window.scrollTo({top: libsCard.offsetTop - 20, behavior:'smooth'});
+}
+async function startPlexLogin(){
+  loginStatus.textContent='Creating Plex login session...'; loginStatus.className='muted';
+  loginCode.style.display='none'; discoverBtn.style.display='none'; accountToken='';
+  const r=await fetch('/api/plex/pin',{method:'POST'});
+  const j=await r.json();
+  if(!j.ok){loginStatus.textContent=String(j.error);loginStatus.className='err';return;}
+  pinId=j.id;
+  loginCode.style.display='block';
+  loginCode.textContent=`Plex code: ${j.code}\nA Plex login window opened. Approve access, then come back here.`;
+  loginStatus.textContent='Waiting for Plex approval...'; loginStatus.className='warn';
+  window.open(j.authUrl,'_blank');
+  if(pollTimer) clearInterval(pollTimer);
+  pollTimer=setInterval(checkPin,2500);
+}
+async function checkPin(){
+  if(!pinId) return;
+  const r=await fetch(`/api/plex/pin/${pinId}`);
+  const j=await r.json();
+  if(!j.ok) return;
+  if(j.authToken){
+    clearInterval(pollTimer); pollTimer=null;
+    accountToken=j.authToken;
+    loginStatus.textContent='Plex login approved. Now discover your servers.'; loginStatus.className='ok';
+    discoverBtn.style.display='block';
+    loginCode.textContent='Login approved. Token received automatically.';
+    await discoverPlex();
+  }
+}
+async function discoverPlex(){
+  if(!accountToken){loginStatus.textContent='Login with Plex first.';loginStatus.className='err';return;}
+  serversCard.style.display='block';
+  discoverStatus.textContent='Discovering owned/shared servers through Plex...'; discoverStatus.className='muted'; servers.innerHTML='';
+  const r=await fetch('/api/discover-plex',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({accountToken})});
+  const j=await r.json();
+  if(!j.ok){discoverStatus.textContent=String(j.error);discoverStatus.className='err';return;}
+  if(!j.servers.length){discoverStatus.textContent='No Plex servers returned by your account.';discoverStatus.className='err';return;}
+  discoverStatus.textContent='Pick a server below. Servers with errors were found but could not be reached from this host.'; discoverStatus.className='ok';
+  servers.innerHTML=j.servers.map((s,i)=>{
+    if(s.error){return `<div class="server"><b>${s.name}</b> ${s.owned?'owned':'shared'}<p class="err small">Not usable from this host: ${s.error}</p></div>`}
+    const safe=JSON.stringify(JSON.stringify(s));
+    return `<div class="server"><b>${s.name}</b> ${s.owned?'owned':'shared'}<br><span class="small muted">${s.plexUrl}</span><p class="small ok">${s.libraries.length} libraries available</p><button onclick='chooseDiscovered(${safe})'>Use This Server</button></div>`
+  }).join('');
+  window.scrollTo({top: serversCard.offsetTop - 20, behavior:'smooth'});
+}
+function chooseDiscovered(json){
+  const s=JSON.parse(json);
+  plexUrl.value=s.plexUrl; plexToken.value=s.token;
+  setLibraries(s.name, s.plexUrl, s.token, s.libraries);
+}
+async function testPlex(){
+  status.textContent='Testing Plex...'; status.className='muted';
+  const r=await fetch('/api/test-plex',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plexUrl:plexUrl.value,plexToken:plexToken.value})});
+  const j=await r.json();
+  if(!j.ok){status.textContent=j.error;status.className='err';return;}
+  status.textContent=`Connected to ${j.server}. Pick libraries below.`; status.className='ok';
+  setLibraries(j.server, plexUrl.value, plexToken.value, j.libraries);
+}
+async function createConfig(){
+  const selected=[...document.querySelectorAll('#libs input:checked')].map(x=>x.value);
+  const r=await fetch('/api/create-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addonName:addonName.value,plexUrl:activePlexUrl,plexToken:activePlexToken,libraries:selected})});
+  const j=await r.json();
+  if(!j.ok){status.textContent=j.error;status.className='err';discoverStatus.textContent=j.error;discoverStatus.className='err';return;}
+  manifest.textContent=j.manifestUrl; stremio.textContent=j.stremioUrl; result.style.display='block';
+  window.scrollTo({top: result.offsetTop - 20, behavior:'smooth'});
+}
+</script>
+</body>
+</html>
